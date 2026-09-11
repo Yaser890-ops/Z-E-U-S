@@ -1,6 +1,7 @@
 import { connect } from "cloudflare:sockets";
 const GLOBAL_TRAFFIC_CACHE = new Map();
 const ACTIVE_CONNECTIONS_COUNT = new Map();
+const GLOBAL_ACTIVE_IPS = new Map();
 const GLOBAL_LAST_ACTIVE_WRITE = new Map();
 const GLOBAL_LAST_DB_WRITE = new Map();
 const GLOBAL_WRITE_LOCK = new Map();
@@ -81,25 +82,9 @@ async function getCachedIps() {
 		const res = await fetchWithFallback("ips.txt");
 		if (!res.ok) return GLOBAL_IPS_CACHE;
 		const text = await res.text();
-		const blocks = text.split("----------");
-		let newData = {};
-		blocks.forEach((block) => {
-			const lines = block
-				.trim()
-				.split("\n")
-				.map((l) => l.trim())
-				.filter((l) => l.length > 0);
-			if (lines.length === 0) return;
-			let opName = "Unknown";
-			const ips = [];
-			lines.forEach((line) => {
-				if (line.includes("#")) opName = line.split("#")[1].trim();
-				else if (!line.startsWith("[source")) ips.push(line);
-			});
-			if (ips.length > 0) newData[opName] = ips;
-		});
-		if (Object.keys(newData).length > 0) {
-			GLOBAL_IPS_CACHE = newData;
+		const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 0 && !l.includes("#") && !l.startsWith("[source"));
+		if (lines.length > 0) {
+			GLOBAL_IPS_CACHE = { "all": lines };
 			GLOBAL_IPS_LAST_FETCH = now;
 		}
 	} catch (e) {}
@@ -107,11 +92,7 @@ async function getCachedIps() {
 }
 function getRandomIps(cachedIpsData, operator, count) {
 	let availableIps = [];
-	if (operator === "all") {
-		Object.values(cachedIpsData).forEach((ips) => (availableIps = availableIps.concat(ips)));
-	} else {
-		availableIps = cachedIpsData[operator] || [];
-	}
+	Object.values(cachedIpsData).forEach((ips) => (availableIps = availableIps.concat(ips)));
 	availableIps = [...new Set(availableIps)];
 	if (availableIps.length === 0) return [];
 	if (count >= availableIps.length) return availableIps;
@@ -392,7 +373,7 @@ export default {
 				return await Router.handlePanel(request, env);
 			}
 			if (url.pathname.startsWith("/status/")) {
-				return await Router.handleUserStatus(url, env);
+				return await Router.handleUserStatus(request, url, env);
 			}
 			let gfxSetting = 'false';
 			try {
@@ -588,7 +569,7 @@ const Router = {
 			},
 		});
 	},
-	async handleUserStatus(url, env) {
+	async handleUserStatus(request, url, env) {
 		const username = safeDecodeURI(url.pathname.slice(8));
 		if (!username) {
 			return new Response("Username is required", { status: 400 });
@@ -611,6 +592,8 @@ const Router = {
 				const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 20);
 				if (randomIps.length > 0) user.ips = randomIps.join("\n");
 			}
+			const userIpsMap = GLOBAL_ACTIVE_IPS.get(user.username);
+			const liveIpCount = userIpsMap ? userIpsMap.size : 0;
 			const userJson = JSON.stringify({
 				username: user.username,
 				uuid: user.uuid,
@@ -620,7 +603,7 @@ const Router = {
 				limit_req: user.limit_req,
 				used_req: (user.used_req || 0) + (USER_REQ_CACHE.get(user.username) || 0),
 				is_active: user.is_active,
-				online_count: getActiveIpCount(user.active_ips),
+				online_count: Math.max(liveIpCount, getActiveIpCount(user.active_ips)),
 				ip_limit: user.ip_limit,
 				created_at: user.created_at,
 				tls: user.tls,
@@ -856,6 +839,7 @@ const Router = {
 			try {
 				GLOBAL_TRAFFIC_CACHE.clear();
 				ACTIVE_CONNECTIONS_COUNT.clear();
+				GLOBAL_ACTIVE_IPS.clear();
 				GLOBAL_LAST_ACTIVE_WRITE.clear();
 				GLOBAL_LAST_DB_WRITE.clear();
 				GLOBAL_WRITE_LOCK.clear();
@@ -1217,7 +1201,9 @@ const Router = {
 								const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 20);
 								if (randomIps.length > 0) finalIps = randomIps.join("\n");
 							}
-							const currentOnlineCount = Math.max((ACTIVE_CONNECTIONS_COUNT.get(user.username) || 0), getActiveIpCount(user.active_ips));
+							const userIpsMap = GLOBAL_ACTIVE_IPS.get(user.username);
+							const liveIpCount = userIpsMap ? userIpsMap.size : 0;
+							const currentOnlineCount = Math.max(liveIpCount, getActiveIpCount(user.active_ips));
 							return {
 								...user,
 								ips: finalIps,
@@ -2034,6 +2020,12 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 		let activeCount = ACTIVE_CONNECTIONS_COUNT.get(uname) || 0;
 		if (hasCountedAsActive) {
 			activeCount = Math.max(0, activeCount - 1);
+			let userIps = GLOBAL_ACTIVE_IPS.get(uname);
+			if (userIps) {
+				let ipConns = userIps.get(clientIP) || 0;
+				if (ipConns <= 1) userIps.delete(clientIP);
+				else userIps.set(clientIP, ipConns - 1);
+			}
 		}
 		if (activeCount <= 0) {
 			ACTIVE_CONNECTIONS_COUNT.delete(uname);
@@ -2492,6 +2484,9 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 			isHeaderParsed = true;
 			let activeCount = ACTIVE_CONNECTIONS_COUNT.get(username) || 0;
 			ACTIVE_CONNECTIONS_COUNT.set(username, activeCount + 1);
+			let userIps = GLOBAL_ACTIVE_IPS.get(username);
+			if (!userIps) { userIps = new Map(); GLOBAL_ACTIVE_IPS.set(username, userIps); }
+			userIps.set(clientIP, (userIps.get(clientIP) || 0) + 1);
 			hasCountedAsActive = true;
 			try {
 				let isDomainAddress = (isTrojanProto && addrType === 3) || (!isTrojanProto && addrType === 2);
@@ -3102,6 +3097,12 @@ function createDownstreamSender(webSocket, headerData = null) {
 	const sendRawChunk = async (chunk) => {
 		if (webSocket.readyState !== 1) throw new Error("ws.readyState is not open");
 		webSocket.send(chunk);
+		if (typeof webSocket.bufferedAmount === "number") {
+			while (webSocket.bufferedAmount > 1024 * 1024) {
+				if (webSocket.readyState !== 1) break;
+				await new Promise(r => setTimeout(r, 20));
+			}
+		}
 	};
 	const attachResponseHeader = (chunk) => {
 		if (!header) return chunk;
@@ -4865,7 +4866,7 @@ const HTML_TEMPLATES = {
 		</div>
 		<button id="global-message-close-btn" class="relative overflow-hidden w-full h-12 bg-transparent border-2 border-red-600 text-red-700 dark:border-red-500 dark:text-red-500 font-black rounded-md text-sm transition-transform duration-300 shadow-lg select-none" style="touch-action: none; -webkit-touch-callout: none; -webkit-user-select: none;">
 			<div id="global-message-progress" class="absolute right-0 top-0 h-full bg-red-500/20 dark:bg-red-500/30 w-0 pointer-events-none"></div>
-			<span class="relative z-10 pointer-events-none">برای بستن ۳ ثانیه نگه دارید</span>
+			<span class="relative z-10 pointer-events-none">برای بستن ۲ ثانیه نگه دارید</span>
 		</button>
 	</div>
 </div>
@@ -6214,7 +6215,13 @@ ${COMMON_TOAST_HTML}
 								headers: { 'Content-Type': 'application/json' },
 								body: JSON.stringify({ reset_action: actionType })
 							});
-							if (res.ok) successCount++;
+							if (res.ok) {
+								successCount++;
+								if (window.smoothCache && window.smoothCache[uname]) {
+									if (actionType === 'volume') window.smoothCache[uname].gb = 0;
+									if (actionType === 'req') window.smoothCache[uname].req = 0;
+								}
+							}
 						} catch(e) {}
 					}));
 					alert('✅ عملیات ریست گروهی ' + actionName + ' با موفقیت برای ' + successCount + ' کاربر اعمال شد.');
@@ -7004,6 +7011,34 @@ async function executeRocketCreate() {
 					return;
 				}
 				const users = data.users || [];
+				
+				window.smoothCache = window.smoothCache || {};
+				const nowMs = Date.now();
+				users.forEach(u => {
+					let cache = window.smoothCache[u.username];
+					if (!cache) {
+						cache = { gb: u.used_gb, req: u.used_req, onlineHistory: [] };
+					}
+					
+					if (u.used_gb < cache.gb && (cache.gb - u.used_gb) < 2.0) {
+						u.used_gb = cache.gb;
+					} else {
+						cache.gb = u.used_gb;
+					}
+					
+					if (u.used_req < cache.req && (cache.req - u.used_req) < 20000) {
+						u.used_req = cache.req;
+					} else {
+						cache.req = u.used_req;
+					}
+					
+					cache.onlineHistory = cache.onlineHistory.filter(h => nowMs - h.time <= 10000);
+					cache.onlineHistory.push({ time: nowMs, count: u.online_count || 0 });
+					u.online_count = Math.max(...cache.onlineHistory.map(h => h.count));
+					
+					window.smoothCache[u.username] = cache;
+				});
+
 				window.allUsers = users;
 				const serverTime = data.serverTime || Date.now();
 				window.lastServerTime = serverTime;
@@ -7554,6 +7589,10 @@ async function executeRocketCreate() {
 						body: JSON.stringify({ reset_action: actionType })
 					});
 					if (response.ok) {
+						if (window.smoothCache && window.smoothCache[username]) {
+							if (actionType === 'volume') window.smoothCache[username].gb = 0;
+							if (actionType === 'req') window.smoothCache[username].req = 0;
+						}
 						alert('عملیات با موفقیت انجام شد.');
 						await loadUsers(true);
 					} else {
@@ -8209,7 +8248,7 @@ function downloadZeusSource() {
 					
 					const animate = (time) => {
 						let elapsed = time - startTime;
-						let percent = Math.min((elapsed / 3000) * 100, 100);
+						let percent = Math.min((elapsed / 2000) * 100, 100);
 						if (prog) prog.style.width = percent + '%';
 						if (percent < 100) {
 							animFrame = requestAnimationFrame(animate);
@@ -8217,7 +8256,7 @@ function downloadZeusSource() {
 					};
 					animFrame = requestAnimationFrame(animate);
 					
-					holdTimer = setTimeout(triggerClose, 3000);
+					holdTimer = setTimeout(triggerClose, 2000);
 				};
 				
 				const handleSecretClick = () => {
@@ -8606,7 +8645,7 @@ window.fillPatternihaValues = function() {
 	const fragInput = document.getElementById('input-advanced-frag');
 	const csInput = document.getElementById('input-cipher-suites');
 	if (fragInput) {
-		fragInput.value = '{"tcp": [{"type": "fragment", "settings": {"packets": "tlshello", "lengths": ["5", "94", "1"], "delays": ["0"], "maxSplit": "0"}},{"type": "fragment", "settings": {"packets": "1-1", "lengths": ["109", "1"], "delays": ["1"], "maxSplit": "355"}}]}';
+		fragInput.value = '{"tcp": [{"type": "fragment", "settings": {"packets": "tlshello", "lengths": ["0", "104", "1"], "delays": ["0"], "maxSplit": "0"}},{"type": "fragment", "settings": {"packets": "1-1", "lengths": ["114", "1"], "delays": ["1"], "maxSplit": "11"}}]}';
 	}
 	if (csInput) {
 		csInput.value = 'TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA:TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256:TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256';
@@ -9021,7 +9060,7 @@ async function testUserSocksProxy() {
 				window.location.reload();
 			}
 		}
-const CURRENT_VERSION = '2.1.1';
+const CURRENT_VERSION = '2.1.2';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		window.autoUpdateStatusCache = false;
 		async function checkAutoUpdateSetup() {
@@ -9200,24 +9239,8 @@ async function fetchIpsList() {
 		const response = await fetchWithFallbackUI('ips.txt');
 		if (!response.ok) throw new Error('Fetch failed');
 		const text = await response.text();
-		const blocks = text.split('----------');
-		cachedIpsData = {};
-		blocks.forEach(block => {
-			const lines = block.trim().split('\\n').map(l => l.trim()).filter(l => l.length > 0);
-			if (lines.length === 0) return;
-			let opName = "Unknown";
-			const ips = [];
-			lines.forEach(line => {
-				if (line.includes('#')) {
-					opName = line.split('#')[1].trim();
-				} else if (!line.startsWith('[source')) {
-					ips.push(line);
-				}
-			});
-			if (ips.length > 0) {
-				cachedIpsData[opName] = ips;
-			}
-		});
+		const lines = text.split('\\n').map(l => l.trim()).filter(l => l.length > 0 && !l.includes('#') && !l.startsWith('[source'));
+		cachedIpsData = { "all": lines };
 		populateIpSelect();
 	} catch (err) {
 		alert('Failed to load IP list from GitHub.');
@@ -9226,11 +9249,18 @@ async function fetchIpsList() {
 }
 function populateIpSelect() {
 	const select = document.getElementById('ip-operator-select');
-	select.innerHTML = '<option value="all">همه (توصیه شده)</option>';
-	Object.keys(cachedIpsData).forEach(op => {
+	select.innerHTML = '';
+	const operators = [
+		{ val: "all", text: "همه (توصیه شده)" },
+		{ val: "irancell_rightel", text: "ایرانسل/رایتل/شاتل" },
+		{ val: "mobinnet_asiatech", text: "مبین نت/فیبر/آسیاتک" },
+		{ val: "mci_tci", text: "همراه اول/مخابرات" },
+		{ val: "aptel_samantel", text: "آپتل/سامانتل/پیشگامان" }
+	];
+	operators.forEach(op => {
 		const option = document.createElement('option');
-		option.value = op;
-		option.textContent = op;
+		option.value = op.val;
+		option.textContent = op.text;
 		select.appendChild(option);
 	});
 }
@@ -9282,13 +9312,9 @@ function applySelectedIps() {
 	let count = parseInt(document.getElementById('ip-count-input').value, 10);
 	if (isNaN(count) || count < 1) count = 10;
 	let availableIps = [];
-	if (operator === 'all') {
-		Object.values(cachedIpsData).forEach(ips => {
-			availableIps = availableIps.concat(ips);
-		});
-	} else {
-		availableIps = cachedIpsData[operator] || [];
-	}
+	Object.values(cachedIpsData).forEach(ips => {
+		availableIps = availableIps.concat(ips);
+	});
 	availableIps = [...new Set(availableIps)];
 	let selectedIps = [];
 	if (count >= availableIps.length) {
