@@ -845,6 +845,18 @@ const Router = {
 				GLOBAL_WRITE_LOCK.clear();
 				DNS_CACHE.clear();
 				USER_REQ_CACHE.clear();
+				LOGIN_ATTEMPTS.clear();
+				GLOBAL_REQ_COUNT = 0;
+				GLOBAL_LAST_REQ_WRITE = 0;
+				GLOBAL_IPS_CACHE = {};
+				GLOBAL_IPS_LAST_FETCH = 0;
+				cachedVipCountries = [];
+				lastVipCountriesFetch = 0;
+				CF_USAGE_CACHE = null;
+				CF_USAGE_LAST_FETCH = 0;
+				CF_USAGE_CACHE_DATE = "";
+				localLastAutoResetCheck = 0;
+				cachedPanelPassword = null;
 				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 			} catch (err) {
 				return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
@@ -2344,6 +2356,15 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 						const { results } = await env.DB.prepare("SELECT * FROM users WHERE is_active = 1").all();
 						if (results) {
 							user = results.find(u => u.uuid && sha224Pure(u.uuid) === userLookupKey);
+							if (user) {
+								const updateHashTask = async () => {
+									try {
+										await env.DB.prepare("UPDATE users SET trojan_hash = ? WHERE id = ?").bind(userLookupKey, user.id).run();
+									} catch (err) {}
+								};
+								if (ctx) ctx.waitUntil(updateHashTask());
+								else updateHashTask();
+							}
 						}
 					}
 				} else {
@@ -2575,7 +2596,34 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 					}
 					const task = (async () => {
 						let s = null;
-						const socks5 = getSelectedUserProxy(user?.user_socks5, request);
+						let socks5 = getSelectedUserProxy(user?.user_socks5, request);
+						
+						const panelHost = request ? new URL(request.url).hostname : null;
+						if (!socks5 && panelHost && addr === panelHost) {
+							if (!GLOBAL_IPS_CACHE.loop_bypass || Date.now() - (GLOBAL_IPS_CACHE.loop_last_fetch || 0) > 3600000) {
+								GLOBAL_IPS_CACHE.loop_bypass = [];
+								const fallbackCountries = ["DE", "US", "GB", "NL", "FR"];
+								for (const fc of fallbackCountries) {
+									try {
+										const res = await fetchWithFallback("proxy_vip/" + fc + ".txt");
+										if (res.ok) {
+											const text = await res.text();
+											const lines = text.split("\n").map(l => l.trim()).filter(l => l.length > 5);
+											if (lines.length > 0) {
+												GLOBAL_IPS_CACHE.loop_bypass = GLOBAL_IPS_CACHE.loop_bypass.concat(lines);
+											}
+										}
+									} catch(e) {}
+								}
+								if (GLOBAL_IPS_CACHE.loop_bypass.length > 0) {
+									GLOBAL_IPS_CACHE.loop_last_fetch = Date.now();
+								}
+							}
+							if (GLOBAL_IPS_CACHE.loop_bypass && GLOBAL_IPS_CACHE.loop_bypass.length > 0) {
+								socks5 = GLOBAL_IPS_CACHE.loop_bypass[Math.floor(Math.random() * GLOBAL_IPS_CACHE.loop_bypass.length)];
+							}
+						}
+
 						if (socks5) {
 							try {
 								s = await connectProxy(socks5, addr, port, dataPayload);
@@ -4573,7 +4621,7 @@ const HTML_TEMPLATES = {
 		<div class="absolute -right-4 -bottom-4 w-16 h-16 bg-green-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
 		<div class="flex items-center justify-between relative z-10">
 			<span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap flex items-center gap-1">
-				<span>کاربران فعال (آنلاین)</span>
+				<span>تعداد اتصال ها</span>
 				<button type="button" onclick="openOnlineCounterWarning();" class="text-red-500 hover:text-red-400 transition-transform hover:scale-110 cursor-pointer inline-flex items-center" title="هشدار">
 					<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
 				</button>
@@ -4689,8 +4737,16 @@ const HTML_TEMPLATES = {
 		<div class="flex items-center justify-between mb-4">
 			<h2 class="text-lg font-bold text-gray-800 dark:text-zinc-200">لیست کاربران</h2>
 			<div class="flex items-center gap-5">
+				<button onclick="createDirectUser(this)" title="افزودن کاربر مستقیم (بدون پروکسی)" class="p-2 rounded-full bg-cyan-50 dark:bg-cyan-950/40 border-2 border-cyan-500 dark:border-cyan-500 hover:bg-cyan-100 dark:hover:bg-cyan-900/60 transition-all duration-300 text-cyan-600 dark:text-cyan-400 shadow-[0_0_15px_rgba(6,182,212,0.6)] hover:shadow-[0_0_25px_rgba(6,182,212,0.95)] hover:scale-125 active:scale-110 cursor-pointer inline-flex items-center justify-center relative group">
+					<span class="absolute -inset-1 rounded-full bg-cyan-500/20 animate-ping opacity-75 group-hover:opacity-100 pointer-events-none" style="animation-delay: 0s;"></span>
+					<svg id="direct-add-icon" class="w-6 h-6 transition-transform duration-300 group-hover:rotate-12 drop-shadow-[0_0_6px_rgba(6,182,212,0.8)] relative z-10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
+						<circle cx="12" cy="12" r="10"></circle>
+						<path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+						<path d="M2 12h20"></path>
+					</svg>
+				</button>
 				<button onclick="openRocketModal(this)" title="افزودن کاربر تک لوکیشن" class="p-2 rounded-full bg-orange-50 dark:bg-orange-950/40 border-2 border-orange-500 dark:border-orange-500 hover:bg-orange-100 dark:hover:bg-orange-900/60 transition-all duration-300 text-orange-600 dark:text-orange-400 shadow-[0_0_15px_rgba(249,115,22,0.6)] hover:shadow-[0_0_25px_rgba(249,115,22,0.95)] hover:scale-125 active:scale-110 cursor-pointer inline-flex items-center justify-center relative group">
-					<span class="absolute -inset-1 rounded-full bg-orange-500/20 animate-ping opacity-75 group-hover:opacity-100 pointer-events-none"></span>
+					<span class="absolute -inset-1 rounded-full bg-orange-500/20 animate-ping opacity-75 group-hover:opacity-100 pointer-events-none" style="animation-delay: 0.33s;"></span>
 					<svg id="rocket-add-icon" class="w-6 h-6 transition-transform duration-300 group-hover:-translate-y-1 group-hover:translate-x-1 drop-shadow-[0_0_6px_rgba(249,115,22,0.8)] relative z-10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
 						<path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"></path>
 						<path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"></path>
@@ -4699,7 +4755,7 @@ const HTML_TEMPLATES = {
 					</svg>
 				</button>
 				<button onclick="quickCreateUser(this)" title="افزودن کاربر مولتی لوکیشن" class="p-2 rounded-full bg-indigo-50 dark:bg-indigo-950/40 border-2 border-indigo-500 dark:border-indigo-500 hover:bg-indigo-100 dark:hover:bg-indigo-900/60 transition-all duration-300 text-indigo-600 dark:text-indigo-400 shadow-[0_0_15px_rgba(99,102,241,0.6)] hover:shadow-[0_0_25px_rgba(99,102,241,0.95)] hover:scale-125 active:scale-110 cursor-pointer inline-flex items-center justify-center relative group">
-					<span class="absolute -inset-1 rounded-full bg-indigo-500/20 animate-ping opacity-75 group-hover:opacity-100 pointer-events-none"></span>
+					<span class="absolute -inset-1 rounded-full bg-indigo-500/20 animate-ping opacity-75 group-hover:opacity-100 pointer-events-none" style="animation-delay: 0.66s;"></span>
 					<svg id="quick-add-icon" class="w-6 h-6 transition-transform duration-300 group-hover:rotate-12 drop-shadow-[0_0_6px_rgba(99,102,241,0.8)] relative z-10" fill="currentColor" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
 				</button>
 				<button onclick="openCreateModal()" title="افزودن کاربر" class="p-2 rounded-full bg-green-50 dark:bg-green-950/30 border-2 border-green-600 dark:border-green-700/60 hover:bg-green-100 dark:hover:bg-green-900/50 transition-all duration-300 text-green-700 dark:text-green-400 shadow-sm hover:shadow hover:scale-110 cursor-pointer inline-flex items-center justify-center">
@@ -4711,28 +4767,79 @@ const HTML_TEMPLATES = {
 			<table class="w-full text-right border-separate" style="border-spacing: 0 8px;">
 				<thead class="text-xs font-bold text-gray-700 dark:text-gray-300">
 					<tr class="text-center">
-						<th class="py-2 px-1.5 w-10 text-center rounded-r-md border-y border-r border-gray-200 dark:border-zinc-800"><input type="checkbox" id="select-all-users" onchange="toggleSelectAllUsers(this)" class="w-5 h-5 rounded-md border-2 border-gray-300 dark:border-zinc-700 text-green-600 bg-white dark:bg-zinc-900 checked:bg-green-600 checked:border-green-600 focus:ring-green-500/50 focus:ring-offset-0 transition-all duration-200 cursor-pointer hover:scale-105 active:scale-95" style="filter: none !important; accent-color: #16a34a !important;"></th>
-						<th class="py-2 px-2 border-y border-gray-200 dark:border-zinc-800">اطلاعات</th>
-						<th class="py-2 px-2 border-y border-gray-200 dark:border-zinc-800">عملیات</th>
-						<th class="py-2 px-2 border-y border-gray-200 dark:border-zinc-800">لینک ساب</th>
-						<th class="py-2 px-2 border-y border-gray-200 dark:border-zinc-800 w-1 whitespace-nowrap">
-							<div class="flex items-center justify-center gap-1">
-								<span>تعداد کانفیگ‌ها</span>
-								<button type="button" onclick="openConfigCountWarning();" class="text-amber-500 hover:text-amber-400 transition-transform hover:scale-125 cursor-pointer inline-flex items-center" title="هشدار">
-									<svg class="w-5 h-5 animate-pulse drop-shadow-[0_0_6px_rgba(245,158,11,0.8)]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
-								</button>
+						<th class="py-3 px-1.5 w-10 text-center rounded-r-md border-y border-r border-gray-200 dark:border-zinc-800 align-middle">
+							<div class="flex flex-col items-center justify-center h-full">
+								<input type="checkbox" id="select-all-users" onchange="toggleSelectAllUsers(this)" class="w-5 h-5 rounded-md border-2 border-gray-300 dark:border-zinc-700 text-green-600 bg-white dark:bg-zinc-900 checked:bg-green-600 checked:border-green-600 focus:ring-green-500/50 focus:ring-offset-0 transition-all duration-200 cursor-pointer hover:scale-105 active:scale-95" style="filter: none !important; accent-color: #16a34a !important;">
 							</div>
 						</th>
-						<th class="py-2 px-2 border-y border-gray-200 dark:border-zinc-800">پورت</th>
-						<th class="py-2 px-2 border-y border-gray-200 dark:border-zinc-800 w-[115px]">حجم</th>
-						<th class="py-2 px-2 border-y border-gray-200 dark:border-zinc-800 w-[115px]">ریکوئست</th>
-						<th class="py-2 px-2 border-y border-gray-200 dark:border-zinc-800 w-[115px]">زمان</th>
-						<th class="py-2 px-2 rounded-l-md border-y border-l border-gray-200 dark:border-zinc-800 w-[115px]">
-							<div class="flex items-center justify-center gap-1">
-								<span>متصل</span>
-								<button type="button" onclick="openOnlineCounterWarning();" class="text-red-500 hover:text-red-400 transition-transform hover:scale-110 cursor-pointer inline-flex items-center" title="هشدار">
-									<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
-								</button>
+						<th class="py-3 px-2 border-y border-gray-200 dark:border-zinc-800 align-middle">
+							<div class="flex flex-col items-center justify-center gap-1.5">
+								<svg class="w-4 h-4 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
+								<span>اطلاعات</span>
+							</div>
+						</th>
+						<th class="py-3 px-2 border-y border-gray-200 dark:border-zinc-800 align-middle">
+							<div class="flex flex-col items-center justify-center gap-1.5">
+								<svg class="w-4 h-4 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"></path></svg>
+								<span>عملیات</span>
+							</div>
+						</th>
+						<th class="py-3 px-2 border-y border-gray-200 dark:border-zinc-800 align-middle">
+							<div class="flex flex-col items-center justify-center gap-1.5">
+								<svg class="w-4 h-4 text-fuchsia-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg>
+								<span>پروتکل</span>
+							</div>
+						</th>
+						<th class="py-3 px-2 border-y border-gray-200 dark:border-zinc-800 align-middle">
+							<div class="flex flex-col items-center justify-center gap-1.5">
+								<svg class="w-4 h-4 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg>
+								<span>لینک ساب</span>
+							</div>
+						</th>
+						<th class="py-3 px-2 border-y border-gray-200 dark:border-zinc-800 w-1 whitespace-nowrap align-middle">
+							<div class="flex flex-col items-center justify-center gap-1.5">
+								<svg class="w-4 h-4 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
+								<div class="flex items-center justify-center gap-1">
+									<span>تعداد کانفیگ‌ها</span>
+									<button type="button" onclick="openConfigCountWarning();" class="text-amber-500 hover:text-amber-400 transition-transform hover:scale-125 cursor-pointer inline-flex items-center" title="هشدار">
+										<svg class="w-4 h-4 animate-pulse drop-shadow-[0_0_6px_rgba(245,158,11,0.8)]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+									</button>
+								</div>
+							</div>
+						</th>
+						<th class="py-3 px-2 border-y border-gray-200 dark:border-zinc-800 align-middle">
+							<div class="flex flex-col items-center justify-center gap-1.5">
+								<svg class="w-4 h-4 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"></path></svg>
+								<span>پورت</span>
+							</div>
+						</th>
+						<th class="py-3 px-2 border-y border-gray-200 dark:border-zinc-800 w-[115px] align-middle">
+							<div class="flex flex-col items-center justify-center gap-1.5">
+								<svg class="w-4 h-4 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4"></path></svg>
+								<span>حجم</span>
+							</div>
+						</th>
+						<th class="py-3 px-2 border-y border-gray-200 dark:border-zinc-800 w-[115px] align-middle">
+							<div class="flex flex-col items-center justify-center gap-1.5">
+								<svg class="w-4 h-4 text-orange-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"></path></svg>
+								<span>ریکوئست</span>
+							</div>
+						</th>
+						<th class="py-3 px-2 border-y border-gray-200 dark:border-zinc-800 w-[115px] align-middle">
+							<div class="flex flex-col items-center justify-center gap-1.5">
+								<svg class="w-4 h-4 text-fuchsia-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+								<span>زمان</span>
+							</div>
+						</th>
+						<th class="py-3 px-2 rounded-l-md border-y border-l border-gray-200 dark:border-zinc-800 w-[115px] align-middle">
+							<div class="flex flex-col items-center justify-center gap-1.5">
+								<svg class="w-4 h-4 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071c3.904-3.905 10.236-3.906 14.142 0M1.394 9.393c5.857-5.857 15.355-5.857 21.213 0"></path></svg>
+								<div class="flex items-center justify-center gap-1">
+									<span>متصل</span>
+									<button type="button" onclick="openOnlineCounterWarning();" class="text-red-500 hover:text-red-400 transition-transform hover:scale-110 cursor-pointer inline-flex items-center" title="هشدار">
+										<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+									</button>
+								</div>
 							</div>
 						</th>
 					</tr>
@@ -4745,6 +4852,8 @@ const HTML_TEMPLATES = {
 				<span>کاربری وجود ندارد. برای ساخت کاربر روی</span>
 				<span class="inline-flex items-center justify-center p-1.5 rounded-full bg-green-50 dark:bg-green-950/30 border border-green-600 dark:border-green-700/60 text-green-700 dark:text-green-400 shadow-sm"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4"></path></svg></span>
 				<span>کلیک کنید یا از دکمه‌های</span>
+				<span class="inline-flex items-center justify-center p-1.5 rounded-full bg-cyan-50 dark:bg-cyan-950/40 border border-cyan-500 text-cyan-600 dark:text-cyan-400 shadow-sm"><svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path><path d="M2 12h20"></path></svg></span>
+				<span>،</span>
 				<span class="inline-flex items-center justify-center p-1.5 rounded-full bg-orange-50 dark:bg-orange-950/40 border border-orange-500 text-orange-600 dark:text-orange-400 shadow-sm"><svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"></path><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"></path><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"></path><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"></path></svg></span>
 				<span>و</span>
 				<span class="inline-flex items-center justify-center p-1.5 rounded-full bg-indigo-50 dark:bg-indigo-950/40 border border-indigo-500 text-indigo-600 dark:text-indigo-400 shadow-sm"><svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></span>
@@ -4855,8 +4964,9 @@ const HTML_TEMPLATES = {
 				لطفاً از این ابزار <span class="whitespace-nowrap">فقط به صورت شخصی و رایگان</span> استفاده کنید.
 			</span>
 		</p>
-		<button onclick="closeFreePanelWarning()" class="w-full py-3.5 bg-transparent border-2 border-green-800 text-green-900 hover:bg-green-800 hover:text-white dark:border-green-800 dark:text-green-700 dark:hover:bg-green-900 dark:hover:text-white font-black rounded-md text-sm transition duration-300 shadow-lg">
-			تأیید و موافقت
+		<button id="free-panel-close-btn" class="relative overflow-hidden w-full h-12 bg-transparent border-2 border-green-800 text-green-900 hover:bg-green-800 hover:text-white dark:border-green-800 dark:text-green-700 dark:hover:bg-green-900 dark:hover:text-white font-black rounded-md text-sm transition-transform duration-300 shadow-lg select-none" style="touch-action: none; -webkit-touch-callout: none; -webkit-user-select: none;">
+			<div id="free-panel-progress" class="absolute right-0 top-0 h-full bg-green-500/20 dark:bg-green-500/30 w-0 pointer-events-none"></div>
+			<span class="relative z-10 pointer-events-none">برای تأیید ۳ ثانیه نگه دارید</span>
 		</button>
 	</div>
 </div>
@@ -5444,8 +5554,30 @@ const HTML_TEMPLATES = {
 									<span>تست اتصال مستقیم</span>
 								</button>
 							</div>
+							<div class="border border-blue-200 dark:border-blue-900/60 bg-blue-50/40 dark:bg-blue-950/20 rounded-xl overflow-hidden shadow-sm">
+								<div class="flex items-center justify-between p-3 bg-blue-100/50 dark:bg-blue-900/40 border-b border-blue-200 dark:border-blue-800/50">
+									<div class="flex items-center gap-2">
+										<span class="text-lg drop-shadow-sm">🌐</span>
+										<span class="text-[11px] font-black text-blue-900 dark:text-blue-300">اتصال مستقیم (بدون پروکسی خروجی)</span>
+									</div>
+									<label class="relative inline-flex items-center cursor-pointer select-none">
+										<input type="checkbox" id="input-enable-direct" checked class="sr-only peer">
+										<div class="w-9 h-5 bg-gray-300 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:bg-blue-600 transition-colors after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-transform peer-checked:after:-translate-x-[16px]"></div>
+									</label>
+								</div>
+								<div class="p-3 space-y-2.5">
+									<p class="text-[10px] font-medium text-blue-800 dark:text-blue-200/80 leading-relaxed text-justify">
+										کانفیگ‌های 🌐 به دلیل نداشتن آی‌پی ثابت، معمولاً دارای <span class="font-bold text-blue-600 dark:text-blue-400">پینگ بهتر و سرعت بالاتری</span> هستند.
+									</p>
+									<div class="flex items-start gap-1.5 p-2 bg-red-50/80 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 rounded-lg shadow-sm">
+										<svg class="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+										<span class="text-[9px] font-bold text-red-700 dark:text-red-400 leading-relaxed text-justify">هشدار: هنگام اتصال به کانفیگ‌های 🌐، از باز کردن پنل خودداری کنید (باعث قطعی و اختلال در عملکرد پنل می‌شود).</span>
+									</div>
+								</div>
+							</div>
+
 							<div class="p-4 bg-gray-50/70 dark:bg-amoled-input/30 border border-gray-200/70 dark:border-amoled-border rounded-xl space-y-3">
-								<div class="flex items-center justify-between">
+								<div class="flex items-center justify-between border-b pb-3 border-gray-200/50 dark:border-amoled-border">
 									<div class="flex items-center gap-2">
 										<svg class="w-4 h-4 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg>
 										<div>
@@ -5458,28 +5590,7 @@ const HTML_TEMPLATES = {
 										<div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:bg-emerald-600 transition-colors after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-transform peer-checked:after:-translate-x-[16px]"></div>
 									</label>
 								</div>
-								<div class="border border-blue-200 dark:border-blue-900/60 bg-blue-50/40 dark:bg-blue-950/20 rounded-xl overflow-hidden shadow-sm">
-									<div class="flex items-center justify-between p-3 bg-blue-100/50 dark:bg-blue-900/40 border-b border-blue-200 dark:border-blue-800/50">
-										<div class="flex items-center gap-2">
-											<span class="text-lg drop-shadow-sm">🌐</span>
-											<span class="text-[11px] font-black text-blue-900 dark:text-blue-300">اتصال مستقیم (بدون پروکسی خروجی)</span>
-										</div>
-										<label class="relative inline-flex items-center cursor-pointer select-none">
-											<input type="checkbox" id="input-enable-direct" checked class="sr-only peer">
-											<div class="w-9 h-5 bg-gray-300 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:bg-blue-600 transition-colors after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-transform peer-checked:after:-translate-x-[16px]"></div>
-										</label>
-									</div>
-									<div class="p-3 space-y-2.5">
-										<p class="text-[10px] font-medium text-blue-800 dark:text-blue-200/80 leading-relaxed text-justify">
-											کانفیگ‌های 🌐 به دلیل نداشتن آی‌پی ثابت، معمولاً دارای <span class="font-bold text-blue-600 dark:text-blue-400">پینگ بهتر و سرعت بالاتری</span> هستند.
-										</p>
-										<div class="flex items-start gap-1.5 p-2 bg-red-50/80 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 rounded-lg shadow-sm">
-											<svg class="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
-											<span class="text-[9px] font-bold text-red-700 dark:text-red-400 leading-relaxed text-justify">هشدار: هنگام اتصال به کانفیگ‌های 🌐، از باز کردن پنل خودداری کنید (باعث قطعی و اختلال در عملکرد پنل می‌شود).</span>
-										</div>
-									</div>
-								</div>
-								<div class="transition-opacity duration-300 opacity-50 pointer-events-none space-y-3 pt-2" id="user-socks5-container">
+								<div class="transition-opacity duration-300 opacity-50 pointer-events-none space-y-3 pt-1" id="user-socks5-container">
 									<div id="proxies-fields-wrapper" class="flex flex-col gap-2 w-full"></div>
 									<button type="button" id="add-proxy-field-btn" onclick="addProxyFieldUI()" class="w-full py-2.5 bg-transparent border-2 border-emerald-500 text-emerald-600 dark:text-emerald-500 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 rounded-lg text-xs font-black transition flex items-center justify-center gap-1.5 shadow-sm">
 										<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
@@ -5572,7 +5683,7 @@ const HTML_TEMPLATES = {
 						<label class="block text-xs font-black text-gray-700 dark:text-zinc-200 mb-1.5 flex items-center gap-1.5">
 							<span class="w-2 h-2 rounded-full bg-purple-500"></span> تعداد
 						</label>
-						<input type="number" id="ip-count-input" min="1" value="20" dir="ltr" class="w-full px-3 py-2.5 bg-white dark:bg-slate-900 border border-gray-200 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-mono text-center font-semibold text-gray-800 dark:text-zinc-100 shadow-sm transition">
+						<input type="number" id="ip-count-input" min="1" max="500" value="20" dir="ltr" class="w-full px-3 py-2.5 bg-white dark:bg-slate-900 border border-gray-200 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-mono text-center font-semibold text-gray-800 dark:text-zinc-100 shadow-sm transition">
 					</div>
 				</div>
 			</div>
@@ -6478,6 +6589,85 @@ ${COMMON_TOAST_HTML}
 			if (show && version) document.getElementById('update-modal-text').innerHTML = 'نسخه جدید (<b>v' + version + '</b>) در دسترس است.<br>اگر آپدیت خودکار عمل نکرد لطفا از ربات استفاده کنید.';
 			setModalState('update-modal', show);
 		}
+		async function createDirectUser(btn) {
+			if (window.isQuickCreateLocked) {
+				showToast('⏳ لطفاً ۵ ثانیه صبر کنید...', 'error');
+				return;
+			}
+			window.isQuickCreateLocked = true;
+			btn.disabled = true;
+			const icon = btn.querySelector('svg');
+			if (icon) {
+				icon.classList.add('animate-spin');
+				icon.classList.remove('group-hover:rotate-12');
+			}
+			try {
+				const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+				let randStr = '';
+				for (let i = 0; i < 8; i++) randStr += chars.charAt(Math.floor(Math.random() * chars.length));
+				const username = randStr;
+				
+				let availableIps = [];
+				if (Object.keys(cachedIpsData).length === 0) {
+					try {
+						const resIps = await fetchWithFallbackUI('ips.txt');
+						if (resIps.ok) {
+							const text = await resIps.text();
+							const blocks = text.split('----------');
+							blocks.forEach(block => {
+								const lines = block.trim().split('\\n').map(l => l.trim()).filter(l => l.length > 0);
+								lines.forEach(line => {
+									if (!line.includes('#') && !line.startsWith('[source')) availableIps.push(line);
+								});
+							});
+						}
+					} catch(e) {}
+				} else {
+					Object.values(cachedIpsData).forEach(ips => { availableIps = availableIps.concat(ips); });
+				}
+				availableIps = [...new Set(availableIps)];
+				let selectedIps = [];
+				if (availableIps.length > 0) {
+					const shuffledIps = availableIps.slice();
+					for (let i = shuffledIps.length - 1; i > 0; i--) {
+						const j = Math.floor(Math.random() * (i + 1));
+						[shuffledIps[i], shuffledIps[j]] = [shuffledIps[j], shuffledIps[i]];
+					}
+					selectedIps = shuffledIps.slice(0, 30);
+				}
+				const ipsStr = selectedIps.join('\\n');
+				
+				const response = await fetch('/api/users', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						username: username, limit_gb: null, expiry_days: null, limit_req: null, ip_limit: null,
+						auto_reset_vol_days: 0, auto_reset_req_days: 0, frag_len: "", frag_int: "",
+						fingerprint: "unsafe", block_ads: 1, block_porn: 0, port: "443", tls: "on",
+						ips: ipsStr, ip_operator: "all", ip_count: 30, auto_rotate_ip: 1, rotate_time: 5,
+						user_socks5: null, auto_rotate_user_proxy: 0, connection_type: "vless", enable_direct: true
+					})
+				});
+				if (response.ok) {
+					showToast('✅ کاربر مستقیم (بدون پروکسی) با موفقیت ایجاد شد.');
+					await loadUsers(true);
+				} else {
+					const errData = await response.json();
+					alert('خطا: ' + (errData.error || 'عملیات ناموفق بود'));
+				}
+			} catch (err) {
+				alert('خطا در برقراری ارتباط با سرور');
+			} finally {
+				setTimeout(() => {
+					window.isQuickCreateLocked = false;
+					btn.disabled = false;
+					if (icon) {
+						icon.classList.remove('animate-spin');
+						icon.classList.add('group-hover:rotate-12');
+					}
+				}, 1000); 
+			}
+		}
 		async function quickCreateUser(btn) {
 			if (window.isQuickCreateLocked) {
 				showToast('⏳ لطفاً ۵ ثانیه صبر کنید...', 'error');
@@ -7055,7 +7245,10 @@ async function executeRocketCreate() {
 				if (d1WritesEl) d1WritesEl.innerText = d1Writes >= 1000 ? (d1Writes / 1000).toFixed(1) + 'k' : d1Writes;
 				const d1ReadsEl = document.getElementById('stat-d1-reads');
 				if (d1ReadsEl) d1ReadsEl.innerText = d1Reads >= 1000000 ? (d1Reads / 1000000).toFixed(2) + 'M' : (d1Reads >= 1000 ? (d1Reads / 1000).toFixed(1) + 'k' : d1Reads);
-				const cfRequests = data.cfRequestsToday || 0;
+				const rawCfRequests = data.cfRequestsToday || 0;
+				window.maxCfRequestsToday = Math.max(window.maxCfRequestsToday || 0, rawCfRequests);
+				const cfRequests = window.maxCfRequestsToday;
+				
 				const reqCard = document.getElementById('card-cf-requests');
 				const warningBtn = document.getElementById('cf-warning-btn');
 				if (cfRequests >= 90000) {
@@ -7077,7 +7270,10 @@ async function executeRocketCreate() {
 						warningBtn.classList.add('hidden');
 					}
 				}
-				const cfTotal = data.cfRequestsTotal || 0;
+				const rawCfTotal = data.cfRequestsTotal || 0;
+				window.maxCfTotal = Math.max(window.maxCfTotal || 0, rawCfTotal);
+				const cfTotal = window.maxCfTotal;
+				
 				document.getElementById('stat-cf-requests').innerText = cfRequests >= 1000 ? (cfRequests / 1000).toFixed(1) + 'k' : cfRequests;
 				document.getElementById('stat-cf-total').innerText = cfTotal >= 1000000 ? (cfTotal / 1000000).toFixed(2) + 'M' : (cfTotal >= 1000 ? (cfTotal / 1000).toFixed(1) + 'k' : cfTotal);
 				const progressPercent = Math.min((cfRequests / 100000) * 100, 100);
@@ -7186,6 +7382,8 @@ async function executeRocketCreate() {
 						emptyState.querySelector('p').innerHTML = '<span>کاربری وجود ندارد. برای ساخت کاربر روی</span>' +
 							'<span class="inline-flex items-center justify-center p-1.5 rounded-full bg-green-50 dark:bg-green-950/30 border border-green-600 dark:border-green-700/60 text-green-700 dark:text-green-400 shadow-sm"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4"></path></svg></span>' +
 							'<span>کلیک کنید یا از دکمه‌های</span>' +
+							'<span class="inline-flex items-center justify-center p-1.5 rounded-full bg-cyan-50 dark:bg-cyan-950/40 border border-cyan-500 text-cyan-600 dark:text-cyan-400 shadow-sm"><svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path><path d="M2 12h20"></path></svg></span>' +
+							'<span>،</span>' +
 							'<span class="inline-flex items-center justify-center p-1.5 rounded-full bg-orange-50 dark:bg-orange-950/40 border border-orange-500 text-orange-600 dark:text-orange-400 shadow-sm"><svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"></path><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"></path><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"></path><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"></path></svg></span>' +
 							'<span>و</span>' +
 							'<span class="inline-flex items-center justify-center p-1.5 rounded-full bg-indigo-50 dark:bg-indigo-950/40 border border-indigo-500 text-indigo-600 dark:text-indigo-400 shadow-sm"><svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></span>' +
@@ -7490,6 +7688,12 @@ async function executeRocketCreate() {
 										'<button data-user="' + encodeURIComponent(user.username) + '" onclick="deleteUser(this.dataset.user)" title="حذف" class="w-[24px] h-[24px] p-0 flex items-center justify-center bg-red-50 dark:bg-red-950/40 border border-red-300 dark:border-red-800 hover:bg-red-100 dark:hover:bg-red-900/60 text-red-600 dark:text-red-400 rounded-full transition shadow-sm"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button>' +
 	
 										'<button data-user="' + encodeURIComponent(user.username) + '" onclick="toggleUserStatus(this.dataset.user)" title="' + statusBtnTitle + '" class="w-[24px] h-[24px] p-0 flex items-center justify-center bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-800 hover:bg-amber-100 dark:hover:bg-amber-900/60 ' + statusBtnColor + ' rounded-full transition shadow-sm">' + statusBtnIcon + '</button>' +
+									'</div>' +
+								'</td>' +
+								'<td class="bg-white/60 dark:bg-zinc-900/40  group-hover:bg-white/80 dark:group-hover:bg-zinc-900/60 p-1 border-y border-gray-200 dark:border-zinc-800 text-xs text-center">' +
+									'<div class="grid grid-flow-row gap-1 w-max mx-auto items-center">' +
+										(enableVless ? '<span class="inline-flex items-center justify-center px-1.5 h-[18px] text-[10px] font-semibold rounded bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400">VLESS</span>' : '') +
+										(enableTrojan ? '<span class="inline-flex items-center justify-center px-1.5 h-[18px] text-[10px] font-semibold rounded bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-400">Trojan</span>' : '') +
 									'</div>' +
 								'</td>' +
 								'<td class="bg-white/60 dark:bg-zinc-900/40  group-hover:bg-white/80 dark:group-hover:bg-zinc-900/60 p-1.5 border-y border-gray-200 dark:border-zinc-800">' +
@@ -8861,7 +9065,42 @@ async function testUserSocksProxy() {
 				return;
 			}
 			try {
-				const backupData = window.allUsers;
+				const backupData = window.allUsers.map(u => {
+					let newU = { ...u };
+					if (newU.user_socks5) {
+						try {
+							if (newU.user_socks5.trim().startsWith("[")) {
+								let arr = JSON.parse(newU.user_socks5);
+								arr = arr.map(item => {
+									let proxyStr = typeof item === 'object' && item !== null ? item.proxy : item;
+									let countryCode = typeof item === 'object' && item !== null ? item.country : null;
+									if (proxyStr && (proxyStr.includes('@') || proxyStr.includes('pass=') || proxyStr.includes('t.me/'))) {
+										if (!countryCode) {
+											try {
+												const cache = JSON.parse(localStorage.getItem('proxy_flag_cache_v2') || '{}');
+												countryCode = cache[proxyStr] || 'UN';
+											} catch(e) { countryCode = 'UN'; }
+										}
+										return { proxy: "VIP_PROXY", country: countryCode };
+									}
+									return item;
+								});
+								newU.user_socks5 = JSON.stringify(arr);
+							} else {
+								let proxyStr = newU.user_socks5;
+								if (proxyStr && (proxyStr.includes('@') || proxyStr.includes('pass=') || proxyStr.includes('t.me/'))) {
+									let countryCode = 'UN';
+									try {
+										const cache = JSON.parse(localStorage.getItem('proxy_flag_cache_v2') || '{}');
+										countryCode = cache[proxyStr] || 'UN';
+									} catch(e) {}
+									newU.user_socks5 = JSON.stringify([{ proxy: "VIP_PROXY", country: countryCode }]);
+								}
+							}
+						} catch(e) {}
+					}
+					return newU;
+				});
 				const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(backupData, null, 2));
 				const downloadAnchor = document.createElement('a');
 				const host = window.location.hostname;
@@ -8931,12 +9170,53 @@ async function testUserSocksProxy() {
 					if (importBtn) importBtn.disabled = true;
 					if (exportBtn) exportBtn.disabled = true;
 					if (closeBtn) closeBtn.disabled = true;
+					
 					let successCount = 0;
 					let currentStep = 0;
+					
+					if (!cachedVipList || cachedVipList.length === 0) {
+						await initVipCache();
+					}
+
 					for (const u of validBackupUsers) {
 						currentStep++;
 						if (importBtn) {
 							importBtn.innerText = '⏳ بازیابی (' + currentStep + '/' + validBackupUsers.length + ')';
+						}
+
+						if (u.user_socks5) {
+							try {
+								if (u.user_socks5.trim().startsWith("[")) {
+									let arr = JSON.parse(u.user_socks5);
+									let changed = false;
+									arr = arr.map(item => {
+										let proxyStr = typeof item === 'object' && item !== null ? item.proxy : item;
+										let countryCode = typeof item === 'object' && item !== null ? item.country : 'UN';
+										if (proxyStr === "VIP_PROXY") {
+											changed = true;
+											let candidateProxies = [];
+											if (countryCode !== 'UN' && cachedVipProxies[countryCode] && cachedVipProxies[countryCode].length > 0) {
+												candidateProxies = cachedVipProxies[countryCode];
+											}
+											if (candidateProxies.length === 0) {
+												let fallbackCountries = cachedVipList && cachedVipList.length > 0 ? cachedVipList : ["DE", "US", "GB", "NL", "FR", "TR"];
+												const randomCountry = fallbackCountries[Math.floor(Math.random() * fallbackCountries.length)];
+												if (cachedVipProxies[randomCountry] && cachedVipProxies[randomCountry].length > 0) {
+													candidateProxies = cachedVipProxies[randomCountry];
+													countryCode = randomCountry;
+												}
+											}
+											let newProxy = "";
+											if (candidateProxies.length > 0) {
+												newProxy = candidateProxies[Math.floor(Math.random() * candidateProxies.length)];
+											}
+											return { proxy: newProxy, country: countryCode };
+										}
+										return item;
+									});
+									if (changed) u.user_socks5 = JSON.stringify(arr);
+								}
+							} catch(e) {}
 						}
 
 						const userDataPayload = {
@@ -9060,7 +9340,7 @@ async function testUserSocksProxy() {
 				window.location.reload();
 			}
 		}
-const CURRENT_VERSION = '2.1.2';
+const CURRENT_VERSION = '2.2.0';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		window.autoUpdateStatusCache = false;
 		async function checkAutoUpdateSetup() {
@@ -9311,6 +9591,10 @@ function applySelectedIps() {
 	const operator = document.getElementById('ip-operator-select').value;
 	let count = parseInt(document.getElementById('ip-count-input').value, 10);
 	if (isNaN(count) || count < 1) count = 10;
+	if (count > 500) {
+		count = 500;
+		document.getElementById('ip-count-input').value = 500;
+	}
 	let availableIps = [];
 	Object.values(cachedIpsData).forEach(ips => {
 		availableIps = availableIps.concat(ips);
@@ -9442,13 +9726,81 @@ function applySelectedIps() {
 				}
 			}, 36000000);
 			setTimeout(() => {
-   			 const freeModal = document.getElementById('free-panel-warning-modal');
+				const freeModal = document.getElementById('free-panel-warning-modal');
 				const freeCard = freeModal.querySelector('div');
 				freeModal.classList.remove('opacity-0', 'pointer-events-none');
 				freeModal.classList.add('opacity-100', 'pointer-events-auto');
 				freeCard.classList.remove('opacity-0', 'scale-95');
 				freeCard.classList.add('opacity-100', 'scale-100');
-			}, 23000);
+
+				const oldBtn = document.getElementById('free-panel-close-btn');
+				if (oldBtn) {
+					const newBtn = oldBtn.cloneNode(true);
+					oldBtn.parentNode.replaceChild(newBtn, oldBtn);
+				}
+
+				const btn = document.getElementById('free-panel-close-btn');
+				const prog = document.getElementById('free-panel-progress');
+				
+				let holdTimer = null;
+				let startTime = 0;
+				let animFrame = null;
+				let secretClickCount = 0;
+				let lastClickTime = 0;
+
+				const triggerClose = () => {
+					stopHold();
+					closeFreePanelWarning();
+				};
+
+				const stopHold = () => {
+					cancelAnimationFrame(animFrame);
+					if (holdTimer) clearTimeout(holdTimer);
+					holdTimer = null;
+					if (prog) prog.style.width = '0%';
+					if (btn) btn.style.transform = 'scale(1)';
+				};
+
+				const startHold = (e) => {
+					stopHold();
+					startTime = performance.now();
+					if (btn) btn.style.transform = 'scale(0.96)';
+
+					const animate = (time) => {
+						let elapsed = time - startTime;
+						let percent = Math.min((elapsed / 3000) * 100, 100);
+						if (prog) prog.style.width = percent + '%';
+						if (percent < 100) {
+							animFrame = requestAnimationFrame(animate);
+						}
+					};
+					animFrame = requestAnimationFrame(animate);
+					holdTimer = setTimeout(triggerClose, 3000);
+				};
+
+				const handleSecretClick = () => {
+					const now = Date.now();
+					if (now - lastClickTime < 400) {
+						secretClickCount++;
+					} else {
+						secretClickCount = 1;
+					}
+					lastClickTime = now;
+					if (secretClickCount >= 3) {
+						triggerClose();
+					}
+				};
+
+				if (btn) {
+					btn.addEventListener('mousedown', startHold);
+					btn.addEventListener('touchstart', startHold, {passive: false});
+					btn.addEventListener('mouseup', stopHold);
+					btn.addEventListener('mouseleave', stopHold);
+					btn.addEventListener('touchend', stopHold);
+					btn.addEventListener('touchcancel', stopHold);
+					btn.addEventListener('click', handleSecretClick);
+				}
+			}, 6000);
 			const gfxToggle = document.getElementById('gfx-toggle');
 			if (gfxToggle) {
 				if (window.GLOBAL_GFX && !window.GLOBAL_GFX.startsWith('/*')) {
@@ -9561,7 +9913,6 @@ function applySelectedIps() {
 				if (e.target.id === 'token-modal') toggleTokenModal(false);
 				if (e.target.id === 'qr-modal') toggleQrModal(false);
 				if (e.target.id === 'usage-warning-modal') closeUsageWarning();
-				if (e.target.id === 'free-panel-warning-modal') closeFreePanelWarning();
 				if (e.target.id === 'online-counter-warning-modal') closeOnlineCounterWarning();
 				if (e.target.id === 'config-count-warning-modal') closeConfigCountWarning();
 				if (e.target.id === 'pattng-info-modal') togglePattNgModal(false);
