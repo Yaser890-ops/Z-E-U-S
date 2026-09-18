@@ -1,0 +1,14 @@
+# مجموعه‌ای کامل و آپدیت از تمام پروتکل‌ها و کشورها
+https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/All_Configs_Sub.txt
+
+# پروکسی‌های فعال روزانه V2RayNG
+https://raw.githubusercontent.com/ALIILAPRO/v2rayng-config/main/sub.txt
+
+# کانفیگ‌های متناوب و پرسرعت گیت‌هاب
+https://raw.githubusercontent.com/MrDarkBoy/v2ray-configs/main/configs.txt
+
+# سابسکریپشن اختصاصی پروتکل VLESS
+https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/Sub1/vless.txt
+
+# سابسکریپشن اختصاصی پروتکل Trojan
+https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/Sub1/trojan.txt
